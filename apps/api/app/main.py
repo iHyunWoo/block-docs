@@ -27,6 +27,7 @@ from app.consumer.worker import OperationConsumer
 from app.db import create_pool
 from app.routes import blocks as blocks_routes
 from app.routes import images as images_routes
+from app.routes import test_helpers as test_helpers_routes
 from app.routes import users as users_routes
 
 
@@ -90,6 +91,7 @@ def create_app() -> FastAPI:
     app.include_router(users_routes.router)
     app.include_router(blocks_routes.router)
     app.include_router(images_routes.router)
+    app.include_router(test_helpers_routes.router)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

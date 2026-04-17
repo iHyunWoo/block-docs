@@ -1,0 +1,21 @@
+# deps
+node_modules
+.pnp
+.pnp.js
+
+# next.js
+/.next/
+/out/
+next-env.d.ts.bak
+
+# misc
+.DS_Store
+*.pem
+.env*.local
+.vercel
+
+# typescript
+*.tsbuildinfo
+
+# testing
+coverage
