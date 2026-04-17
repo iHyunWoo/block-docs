@@ -31,6 +31,15 @@ export async function openAsUser(
   await page.goto(`${webUrl}/docs/${DEMO_DOC_ID}`);
   // Wait for the editor shell to be ready.
   await expect(page.getByTestId('block-editor')).toBeVisible({ timeout: 15_000 });
+  // Wait until the WebSocket has opened so the crdt sendQueue flushes.
+  await page.waitForFunction(
+    () => {
+      const ws = (window as unknown as { __blockDocsWs?: { isOpen?: () => boolean } }).__blockDocsWs;
+      return ws?.isOpen?.() === true;
+    },
+    undefined,
+    { timeout: 10_000 },
+  );
   return { context, page };
 }
 
@@ -56,4 +65,15 @@ export async function resetDoc(docId = DEMO_DOC_ID) {
  */
 export async function typeIntoFocused(page: Page, text: string) {
   await page.keyboard.type(text, { delay: 20 });
+}
+
+/**
+ * Click a block by its index (0-based) and ensure the internal contentEditable
+ * is focused. Works around click-on-padding cases where the wrapper gets the
+ * click but the contenteditable child doesn't receive focus automatically.
+ */
+export async function focusBlockAt(page: Page, index = 0) {
+  const wrap = page.getByTestId('block').nth(index);
+  const ce = wrap.locator('[contenteditable="true"]');
+  await ce.click();
 }

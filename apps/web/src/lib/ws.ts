@@ -28,6 +28,7 @@ export class WsClient {
   private listeners = new Set<Listener>();
   private openListeners = new Set<() => void>();
   private closeListeners = new Set<() => void>();
+  private sendQueue: ClientMessage[] = [];
   public lastStreamId: string | null;
 
   constructor(private readonly docId: number | string) {
@@ -49,12 +50,36 @@ export class WsClient {
     }
   }
 
+  /** Close any active socket and re-open immediately. Used by tests. */
+  reconnect(): void {
+    if (this.ws) {
+      // Flag this as a non-user close so scheduleReconnect stays armed.
+      this.closedByUser = false;
+      this.ws.close();
+      this.ws = null;
+    }
+    this.connect();
+  }
+
   send(msg: ClientMessage): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      // Drop silently — ops layer should retry via REST fallback.
+      // Queue until the connection is open — crdt deltas MUST NOT be dropped
+      // silently or we lose keystrokes that happened before the first open.
+      // Ops (`ch:'ops'`) are still additionally backed by the pendingOps
+      // queue in the store, so this is primarily about crdt continuity.
+      this.sendQueue.push(msg);
       return;
     }
     this.ws.send(JSON.stringify(msg));
+  }
+
+  private flushSendQueue(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const pending = this.sendQueue;
+    this.sendQueue = [];
+    for (const msg of pending) {
+      this.ws.send(JSON.stringify(msg));
+    }
   }
 
   onMessage(fn: Listener): () => void {
@@ -90,6 +115,7 @@ export class WsClient {
 
     ws.addEventListener("open", () => {
       this.reconnectAttempt = 0;
+      this.flushSendQueue();
       for (const fn of this.openListeners) fn();
     });
 

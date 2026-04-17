@@ -27,23 +27,31 @@ def bus_key(doc_id: int) -> str:
     return BUS_KEY_PATTERN.format(doc_id=doc_id)
 
 
+def _as_str(value: object) -> str:
+    """XADD returns bytes when decode_responses=False — normalise to str."""
+    if isinstance(value, bytes):
+        return value.decode()
+    return str(value)
+
+
 async def xadd_ops(
     redis: aioredis.Redis, doc_id: int, ops_json: str, user_id: int
 ) -> str:
     """Append an `ops` entry to the doc stream. Returns the new stream id."""
-    return await redis.xadd(
+    raw = await redis.xadd(
         stream_key(doc_id),
         {"kind": "ops", "ops": ops_json, "userId": str(user_id)},
         maxlen=STREAM_MAXLEN_APPROX,
         approximate=True,
     )
+    return _as_str(raw)
 
 
 async def xadd_crdt(
     redis: aioredis.Redis, doc_id: int, block_id: str, delta: bytes, user_id: int
 ) -> str:
     """Append a `crdt` entry — used by WS, not by API, but kept here for symmetry."""
-    return await redis.xadd(
+    raw = await redis.xadd(
         stream_key(doc_id),
         {
             "kind": "crdt",
@@ -54,6 +62,7 @@ async def xadd_crdt(
         maxlen=STREAM_MAXLEN_APPROX,
         approximate=True,
     )
+    return _as_str(raw)
 
 
 async def publish_bus(

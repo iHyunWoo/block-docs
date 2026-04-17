@@ -19,12 +19,12 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/api/v1/docs/{doc_id}/_reset", status_code=204)
+@router.post("/api/v1/docs/{doc_id}/_reset")
 async def reset_doc(
     doc_id: int,
     request: Request,
     x_test_mode: str | None = Header(default=None, alias="X-Test-Mode"),
-) -> None:
+) -> dict[str, str]:
     """Wipe the document's blocks, ops log, comments, and Redis stream.
 
     The `documents` row itself is left intact so the demo always has doc_id=1.
@@ -75,3 +75,5 @@ async def reset_doc(
             doc_id,
             '{"children": [{"type": "text", "text": ""}]}',
         )
+
+    return {"status": "reset", "doc_id": str(doc_id)}

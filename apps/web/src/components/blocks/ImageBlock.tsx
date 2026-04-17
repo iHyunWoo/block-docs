@@ -42,6 +42,7 @@ export function ImageBlock({ block }: Props) {
         <div className="image-picker">
           <input
             ref={inputRef}
+            data-testid="image-upload-input"
             type="file"
             accept="image/*"
             hidden

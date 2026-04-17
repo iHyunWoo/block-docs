@@ -22,8 +22,8 @@ up: ## Start full stack (postgres + redis + api + ws x2 + web x2) with hot reloa
 	@echo "  ws-1:     ws://localhost:4001"
 	@echo "  ws-2:     ws://localhost:4002"
 	@echo "  api:      http://localhost:8000 (docs: /docs)"
-	@echo "  postgres: localhost:5432 (blockdocs/blockdocs/blockdocs)"
-	@echo "  redis:    localhost:6379"
+	@echo "  postgres: localhost:5442 (blockdocs/blockdocs/blockdocs)"
+	@echo "  redis:    localhost:6390"
 	@echo ""
 	@echo "Run 'make logs' to follow all logs, 'make seed' to insert demo data."
 

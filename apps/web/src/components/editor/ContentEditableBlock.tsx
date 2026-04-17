@@ -268,6 +268,14 @@ export const ContentEditableBlock = forwardRef<ContentEditableHandle, Props>(
     const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
       const root = domRef.current;
       if (!root) return;
+      // Fallback: some browsers / automation drivers fire keydown without
+      // following up with a proper `insertParagraph` beforeinput event.
+      // Handling Enter here ensures block splitting works in every case.
+      if (e.key === "Enter" && !e.shiftKey && !isComposingRef.current) {
+        e.preventDefault();
+        onEnter?.();
+        return;
+      }
       if (e.key === "/" && yText.length === 0) {
         e.preventDefault();
         onSlash?.();

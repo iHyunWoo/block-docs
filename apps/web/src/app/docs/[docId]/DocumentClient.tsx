@@ -30,6 +30,15 @@ export function DocumentClient({ docId }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [requestFocusBlockId, setRequestFocusBlockId] = useState<string | null>(null);
 
+  // Expose ws client to tests (reconnect.spec.ts drives close() / reconnect()).
+  useEffect(() => {
+    if (typeof window === "undefined" || !ws) return;
+    (window as unknown as { __blockDocsWs?: unknown }).__blockDocsWs = ws;
+    return () => {
+      delete (window as unknown as { __blockDocsWs?: unknown }).__blockDocsWs;
+    };
+  }, [ws]);
+
   // ---- Yjs registry (scoped to this doc) ----
   const yjs = useMemo(() => {
     return new YjsRegistry(({ blockId, deltaB64 }) => {

@@ -57,7 +57,7 @@ export function SlashMenu({ open, anchor, onPick, onClose }: Props) {
 
   if (!open || !anchor) return null;
   return (
-    <div className="slash-menu" role="listbox">
+    <div className="slash-menu" role="listbox" data-testid="slash-menu">
       {OPTIONS.map((opt, i) => (
         <button
           key={opt.key}

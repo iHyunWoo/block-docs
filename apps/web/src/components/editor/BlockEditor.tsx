@@ -147,7 +147,7 @@ export function BlockEditor({
   // ---- Empty doc: offer a starter block ----
   if (ordered.length === 0) {
     return (
-      <div className="block-editor-empty">
+      <div className="block-editor-empty" data-testid="block-editor">
         <button
           className="empty-start-button"
           onClick={() => {
@@ -162,7 +162,7 @@ export function BlockEditor({
   }
 
   return (
-    <div className="block-editor">
+    <div className="block-editor" data-testid="block-editor">
       <Toolbar handle={toolbarHandle} />
       {ordered.map((block, i) => {
         const handlers = makeHandlers(block, i);
@@ -171,6 +171,9 @@ export function BlockEditor({
           <div
             key={block.blockId}
             className="block-wrap"
+            data-testid="block"
+            data-block-id={block.blockId}
+            data-block-type={block.type}
             onFocus={() => {
               const h = handles.current.get(block.blockId);
               setFocusedBlockId(block.blockId);

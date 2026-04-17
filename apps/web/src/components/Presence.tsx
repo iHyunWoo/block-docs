@@ -12,6 +12,8 @@ export function Presence() {
         <span
           key={u.userId}
           className="presence-dot"
+          data-testid="presence-dot"
+          data-user-id={u.userId}
           title={u.name}
           style={{ backgroundColor: u.color }}
         >
