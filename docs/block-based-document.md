@@ -981,37 +981,59 @@ ORDER BY parent_id NULLS FIRST, position;
   각 스냅샷: ~200KB (100블록 Yjs 바이너리)
   총 DB 쓰기: ~2MB, 대형 BYTEA 10회 UPSERT
 
-신규 (Block Operation):
-  변경된 블록만 debounced (10초) 저장
-  3명 × 10블록 = 30개 블록 UPDATE
-  각 UPDATE: ~0.5KB JSONB
-  총 DB 쓰기: ~15KB, 소형 JSONB 30회 UPDATE
+신규 (Stream event log + stateless Consumer):
+  Consumer가 blockId별로 batch 처리 (같은 블록 연속 delta는 하나의 UPDATE로 flush)
+  3명 × 10블록 = 30개 블록 × 평균 5회 flush = 150 UPDATE
+  각 UPDATE: ~0.5KB JSONB + ~1KB yjs_state BYTEA = ~1.5KB
+  총 DB 쓰기: ~225KB, 소형 row-level UPDATE 150회
 
-→ 쓰기량 ~99% 감소. 횟수 3배 증가하나 각각 매우 작음.
-  PostgreSQL은 소형 JSONB UPDATE를 대형 BYTEA UPSERT보다 훨씬 효율적으로 처리.
+→ 쓰기량 ~90% 감소. 횟수는 증가하나 per-row가 작아 WAL/TOAST 모두 효율적.
+  state bytes는 블록당 ~1KB 수준으로 기존 "문서 전체 수MB"와 다름.
 ```
 
 **WebSocket 서버 부하**
 
 ```
 현재: Yjs delta를 Room 전체에 relay (바이너리, 해석 안 함)
-신규: Yjs delta를 Room 전체에 relay (바이너리, blockId 태그 추가)
+신규: Yjs delta를 Room 전체에 relay + Redis Stream XADD
 
-→ 동일. 메시지에 blockId 필드 하나 추가된 것 외에 차이 없음.
+→ relay 자체는 동일. XADD가 추가되나 delta 하나당 ~0.1ms 수준.
+  WS 서버는 여전히 stateless. 수평 확장 자유.
 ```
 
 **Redis 부하**
 
 ```
 현재:
-  Redis Stream: 키스트로크 단위 Yjs delta 전부 적재
+  Redis Stream: 키스트로크 단위 Yjs delta 적재
   Redis Pub/Sub: 같은 delta를 Room broadcast
 
 신규:
-  Redis Pub/Sub: crdt delta relay (현재와 동일)
-  Redis Stream: update_block operation만 (10초 debounce, 빈도 훨씬 낮음)
+  Redis Stream: 키스트로크 단위 crdt delta + ops 적재 (진실의 원천)
+  Redis Pub/Sub: WS 인스턴스 간 fan-out (doc:{docId}:bus)
 
-→ Redis Stream 부하 감소. 키스트로크 단위 delta가 Stream에 쌓이지 않음.
+→ 부하 수준은 비슷. 차이는 "Stream이 source of truth" 역할을 가짐.
+  MAXLEN~100000 retention으로 키스트로크 단위 적재도 무리 없음.
+  100블록 문서, 10명 동시 편집 시에도 수분 내의 delta 역사가 보존됨.
+```
+
+**Consumer (pycrdt 워커) 부하**
+
+```
+Delta 하나당:
+  1. SELECT yjs_state: ~0.3ms (primary key index)
+  2. pycrdt Y.Doc 생성: ~0.01ms
+  3. apply_update(state): 블록당 ~1KB 로드, ~0.5ms
+  4. apply_update(delta): ~0.1ms
+  5. encode_state_as_update: ~0.5ms
+  6. Y.Text → InlineNode[] 추출: ~0.3ms
+  7. UPDATE (yjs_state, content, last_applied_stream_id): ~0.5ms
+
+합계: 블록당 ~2.2ms
+
+3명 × 초당 5회 타이핑 = 초당 15 delta
+  Batch(같은 블록 연속 delta 모음)로 약 초당 5~10 UPDATE
+  → Consumer 1대로 충분. doc_id/blockId 기반 partition으로 수평 확장 가능.
 ```
 
 #### 4.6.3 주의 시나리오
@@ -1290,6 +1312,125 @@ const BlockList = () => {
 }
 ```
 
+> **편집 중 블록 언마운트 금지**: 가상화에서 현재 편집 중인 블록이 뷰포트를 벗어나면 DOM에서 제거되지만, Y.Text 인스턴스는 유지되어야 한다. `focusedBlockId` 를 overscan 계산에 포함시켜서 해당 블록을 항상 렌더 범위에 포함.
+
+### 5.6 에디터 세부 동작
+
+Custom contentEditable 기반이라 Tiptap이 해주던 것들을 직접 구현해야 한다. 여기서는 **결정이 필요한 지점만** 정리한다.
+
+#### 5.6.1 Undo / Redo
+
+| 전략 | 장단 |
+|---|---|
+| **내 변경만 undo** (권장, Yjs 표준) | Y.UndoManager가 origin 기반으로 로컬 origin만 되돌림. 협업 친화적 |
+| **블록 전체 상태 undo** | 원격 변경도 되돌림. 동료 입장에선 이해 불가 — 권장 안 함 |
+
+구현:
+- `Y.Doc` 마다 `UndoManager({ trackedOrigins: new Set(['local']) })` 부착.
+- 블록 구조 op(insert/delete/move)는 BlockStore의 로컬 history 스택에 별도 추가.
+- `Ctrl+Z`는 다음 순서로 처리: (1) 현재 포커스 블록의 Y.UndoManager.undo(), (2) 없으면 BlockStore 구조 op 스택 pop.
+
+> "내 변경만 undo"는 나의 개입이 없는 동안 들어온 원격 변경을 건드리지 않으므로 협업자 경험을 해치지 않는다. Google Docs 동일 정책.
+
+#### 5.6.2 붙여넣기 정규화
+
+| 소스 | 처리 |
+|---|---|
+| `text/markdown` (직접 카피) | `marked` lexer → Block[] / InlineNode[] |
+| `text/html` (웹/Notion/Docs에서 카피) | HTML → 정규화된 Block[] |
+| `text/plain` (plain text) | paragraph 블록 하나에 문자열로 삽입 |
+| 이미지 (`image/*`) | presigned URL 발급 후 `image` 블록 삽입 |
+
+HTML 소스별 처리 전략:
+- **공통 허용 태그 화이트리스트**: `h1~h6`, `p`, `ul`, `ol`, `li`, `pre`, `code`, `blockquote`, `hr`, `a`, `strong`, `em`, `s`, `img`.
+- 그 외는 텍스트만 추출.
+- `style` 속성은 무시 (에디터의 블록 타입 시스템에 맞추는 것이 원칙).
+
+> 복잡한 붙여넣기(Google Docs의 중첩 표, Notion의 toggle 등)는 **완벽 재현보다 정보 보존**을 우선. 표는 paragraph로 평탄화해서라도 텍스트 내용은 살려둔다.
+
+#### 5.6.3 @Mention
+
+트리거: `@` 입력 후 문자 입력 시작 → 팝업.
+
+```
+상태 머신:
+  idle → typingMention (@ 입력 시)
+  typingMention → selecting (↑↓ 키 / 마우스 hover)
+  selecting → confirmed (Enter / 클릭)
+  typingMention → idle (Esc / 다른 문자로 이탈)
+
+confirmed에서:
+  Y.Text.delete(startOffset, currentLength)   // @xxx 제거
+  Y.Text.insertEmbed(startOffset, {
+    type: 'mention', attrs: { userId, label }
+  })
+  → InlineNode[]에서 mention은 단일 원자 단위로 렌더
+  → 커서는 mention 뒤로 이동
+```
+
+**중요**: mention은 단일 원자. Backspace 시 `label`의 첫 글자부터 지우지 말고 전체를 한 번에 삭제.
+
+구현 주의:
+- Yjs `insertEmbed`로 박은 custom node는 Y.Text 내부에 '객체'로 저장. `toDelta()`로 추출할 때 `insert: { type:'mention', ... }` 형태로 나옴 → InlineNode[] 변환에서 매핑.
+- 팝업은 `focusedBlockId` + 커서 위치(offset) 기반. 블록이 스크롤로 이동해도 따라가야 하므로 포털(Portal)로 렌더.
+
+#### 5.6.4 멀티 블록 선택 / 드래그
+
+선택 모델 (BlockStore):
+```typescript
+selection: 
+  | { mode: 'text';  blockId: string; anchor: number; focus: number }
+  | { mode: 'block'; blockIds: Set<string>; anchor: string; focus: string }
+  | null
+```
+
+상호 전환:
+- 텍스트 선택 상태에서 `Shift+Click` 다른 블록 → `block` 모드로 전환, `[anchor, focus]` 범위의 블록 모두 선택.
+- `block` 모드에서 `Ctrl/Cmd+Click` → 개별 블록 토글 추가/제거.
+- 방향키로 선택 확장 (Shift+↑/↓).
+
+드래그 앤 드롭:
+- `block` 모드에서 drag start → 커스텀 `DragOverlay` 표시.
+- 드롭 위치(블록 사이 공간)를 `BlockDropZone` 컴포넌트가 감지.
+- 드롭 확정 시 선택된 블록 각각에 대해 `move_block` op를 생성 (batch).
+- 드래그 중 **충돌 규칙**: 선택된 블록의 자손 위로 드롭하려고 하면 금지 (트리 사이클 방지).
+
+일괄 작업:
+- `block` 모드에서 `Backspace/Delete` → 선택된 블록 전부 `delete_block` batch.
+- `Cmd+C` → 선택된 블록의 serialize된 JSON을 clipboard `text/x-blockdocs` MIME + 대응 markdown을 `text/plain`에 저장 (다른 에디터와 호환).
+- `Cmd+V` → 붙여넣기 정규화가 처리.
+
+구현 팁:
+- `window.getSelection()`의 native selection은 **텍스트 모드에만 유효**. block 모드에선 native selection을 클리어하고 커스텀 하이라이트(CSS `outline`)로 표시.
+- `document.execCommand('copy')` 대신 Clipboard API(`navigator.clipboard.write`) 사용.
+
+#### 5.6.5 IME (한국어/일본어/중국어)
+
+composition 이벤트를 반드시 처리:
+
+```typescript
+// 편집 중 원격 delta가 들어오면 DOM 재렌더 미룸
+let isComposing = false
+
+el.addEventListener('compositionstart', () => { isComposing = true })
+el.addEventListener('compositionend',   () => {
+  isComposing = false
+  flushPendingRemoteRender()   // 미뤄둔 원격 변경 적용
+})
+
+// Y.Text observe에서:
+yText.observe((event, transaction) => {
+  if (transaction.origin === 'local') return
+  if (isComposing) {
+    scheduleRenderAfterComposition()
+  } else {
+    renderInlineNodes(el, yText.toDelta())
+  }
+})
+```
+
+한국어 조합 중 DOM을 강제로 교체하면 조합이 깨져 글자가 중복되거나 유실됨. **반드시** composition 구간은 건너뛴다.
+
 ---
 
 ## 6. 백엔드 API 설계
@@ -1300,14 +1441,15 @@ const BlockList = () => {
 # 문서 블록 전체 조회 (초기 로드)
 GET /api/v2/workspaces/{wid}/docs/{docId}/blocks
 Response: {
-  blocks: Block[],       // 트리 구조 (children 포함)
-  serverSeq: number      // 현재 시퀀스 (WebSocket 재연결 시 delta 요청용)
+  docId: number,
+  blocks: Block[],         // 트리 구조 (children 포함)
+  lastStreamId: string     // Redis Stream의 현재 tail. WS 재접속 시 sinceStreamId로 전달
 }
 
 # 블록 Operations 제출 (비-WebSocket 폴백, 오프라인 동기화)
 POST /api/v2/workspaces/{wid}/docs/{docId}/operations
-Body: { ops: Operation[], clientSeq: number }
-Response: { results: OpResult[], serverSeq: number }
+Body: { ops: BlockOperation[], clientSeq: number }
+Response: { results: OpResult[], streamId: string }   # 적용된 op의 Stream id
 
 # 단일 블록 조회
 GET /api/v2/workspaces/{wid}/docs/{docId}/blocks/{blockId}
@@ -1317,67 +1459,128 @@ GET /api/v2/workspaces/{wid}/docs/{docId}/blocks/{blockId}/history
 Response: { versions: BlockVersion[] }
 
 # 문서 히스토리 (operation log)
-GET /api/v2/workspaces/{wid}/docs/{docId}/history?since={serverSeq}
-Response: { ops: Operation[], latestSeq: number }
+GET /api/v2/workspaces/{wid}/docs/{docId}/history?sinceStreamId={id}
+Response: { ops: BlockOperation[], latestStreamId: string }
 
 # 문서 검색 (블록 내용 full-text)
 GET /api/v2/workspaces/{wid}/docs/search?q={query}
 Response: { results: [{ docId, blockId, snippet, ... }] }
+
+# 이미지 presigned URL
+POST /api/v2/workspaces/{wid}/images/presign
+Body: { contentType: string, size: number }
+Response: { uploadUrl: string, publicUrl: string, imageId: string }
+# imageId는 업로더 userId를 포함해 생성됨 → 같은 파일도 유저마다 다른 URL
 ```
+
+> **lastStreamId의 역할**: DB는 Consumer의 lag을 허용하므로 블록 스냅샷이 완전 최신이 아닐 수 있다. 클라이언트는 이 id를 저장해두고 WebSocket 접속 시 `sinceStreamId`로 보내, 서버가 Stream tail의 delta를 replay하게 한다. 이걸로 "DB lag 윈도우"가 UX에 드러나지 않는다.
 
 ### 6.2 Operation Consumer (Redis Stream → DB)
 
+**역할 분담**
+- **구조 op (`kind=ops`)**: API 라우트가 트랜잭션 내에서 DB 반영 + Stream XADD. Consumer는 XACK만.
+- **텍스트 delta (`kind=crdt`)**: Consumer가 `yjs_state`를 DB에서 로드해 pycrdt로 apply 후 저장. 완전 stateless.
+
 ```python
-# api-docs/app/document/infrastructure/consumers/operation_consumer.py
+# apps/api/app/consumer/worker.py
+
+import pycrdt as Y
+from app.ops.inline import ytext_to_inline_nodes
 
 class OperationConsumer:
     """
-    Redis Stream에서 block operation을 소비하여 DB에 영속화.
+    Stream의 crdt delta를 소비해 doc_blocks의 yjs_state + content를 갱신.
     
-    기존 SnapshotWorker와의 차이:
-    - 기존: 30초마다 yjs_state_bytes 전체 UPSERT
-    - 신규: operation 단위로 해당 block만 INSERT/UPDATE/DELETE
+    원칙:
+      - 인메모리 Y.Doc 유지 없음 (매 이벤트마다 임시 생성/파괴)
+      - last_applied_stream_id로 idempotency 보장
+      - blockId별 FOR UPDATE row lock으로 동시 처리 race 차단
     """
     
-    BATCH_SIZE = 50         # 한 번에 처리할 최대 operation 수
-    BATCH_TIMEOUT_MS = 2000 # 2초 내 BATCH_SIZE 미달이면 즉시 처리
+    BATCH_SIZE = 50
+    BATCH_TIMEOUT_MS = 2000
     
     async def consume(self):
         while True:
-            ops = await self.redis.xreadgroup(
-                group='block-ops-group',
-                consumer=self.consumer_id,
-                streams={'doc_operations_stream': '>'},
+            # 동적 스트림 목록: 주기적으로 SCAN MATCH doc:*:stream 으로 갱신
+            streams = await self._active_streams()
+            if not streams:
+                await asyncio.sleep(1)
+                continue
+            
+            entries = await self.redis.xreadgroup(
+                groupname='block-ops',
+                consumername=self.consumer_id,
+                streams={s: '>' for s in streams},
                 count=self.BATCH_SIZE,
                 block=self.BATCH_TIMEOUT_MS,
             )
-            
-            if ops:
-                # doc_id별로 그룹핑하여 트랜잭션 단위 최적화
-                grouped = group_by_doc_id(ops)
-                for doc_id, doc_ops in grouped.items():
-                    await self._apply_operations(doc_id, doc_ops)
+            if entries:
+                await self._process_batch(entries)
     
-    async def _apply_operations(self, doc_id: int, ops: list[Operation]):
-        async with self.db.begin() as tx:
-            for op in ops:
-                match op.op_type:
-                    case 'insert_block':
-                        await self._insert_block(tx, op)
-                    case 'update_block':
-                        await self._update_block(tx, op)
-                    case 'delete_block':
-                        await self._delete_block(tx, op)
-                    case 'move_block':
-                        await self._move_block(tx, op)
-            
-            # 문서 updated_at 갱신 (한 번만)
-            await tx.execute(
-                update(Document)
-                .where(Document.id == doc_id)
-                .values(updated_at=func.now())
+    async def _process_batch(self, entries):
+        # 같은 (stream, blockId) 연속 엔트리는 한 트랜잭션에서 batch apply
+        by_block = defaultdict(list)
+        for stream_key, stream_entries in entries:
+            for entry_id, fields in stream_entries:
+                if fields[b'kind'] == b'crdt':
+                    block_id = UUID(fields[b'blockId'].decode())
+                    by_block[(stream_key, block_id)].append((entry_id, fields))
+        
+        for (stream_key, block_id), block_entries in by_block.items():
+            await self._apply_crdt_batch(stream_key, block_id, block_entries)
+        
+        # XACK은 모든 처리 성공 시에만
+        acks_by_stream = defaultdict(list)
+        for stream_key, stream_entries in entries:
+            acks_by_stream[stream_key].extend(eid for eid, _ in stream_entries)
+        for stream_key, ids in acks_by_stream.items():
+            await self.redis.xack(stream_key, 'block-ops', *ids)
+    
+    async def _apply_crdt_batch(self, stream_key, block_id, entries):
+        async with self.db.transaction():
+            row = await self.db.fetchrow(
+                "SELECT yjs_state, last_applied_stream_id "
+                "FROM doc_blocks WHERE block_id = $1 FOR UPDATE",
+                block_id,
             )
+            if not row:
+                return  # 블록이 이미 삭제됨 — skip
+            
+            # 임시 Y.Doc 생성. 함수 종료 시 GC.
+            doc = Y.Doc()
+            doc['root'] = Y.Text()
+            if row['yjs_state']:
+                doc.apply_update(bytes(row['yjs_state']))
+            
+            last_applied = row['last_applied_stream_id']
+            for entry_id, fields in entries:
+                entry_id_str = entry_id.decode()
+                if last_applied and entry_id_str <= last_applied:
+                    continue  # idempotent
+                doc.apply_update(bytes(fields[b'delta']))
+                last_applied = entry_id_str
+            
+            new_state = doc.get_update()
+            new_content = {
+                'children': ytext_to_inline_nodes(doc['root']),
+            }
+            
+            await self.db.execute(
+                "UPDATE doc_blocks "
+                "SET yjs_state = $1, content = $2, "
+                "    last_applied_stream_id = $3, updated_at = now() "
+                "WHERE block_id = $4",
+                new_state, json.dumps(new_content), last_applied, block_id,
+            )
+        # doc은 with 블록 종료 후 GC — 인메모리 보존 없음
 ```
+
+**수평 확장**: 여러 Consumer 인스턴스를 돌려도 동일 `block-ops` 그룹에 속하면 메시지가 겹치지 않음. Redis Stream consumer group이 partition을 자동 분배. 블록 단위 `FOR UPDATE`로 서로 다른 Consumer가 같은 블록을 동시에 쓰지 않도록 보호.
+
+**Cold start (yjs_state = NULL)**: `insert_block` 직후엔 state가 비어있음. 빈 Y.Doc에 첫 delta를 쌓으며 state가 자라감.
+
+**Stream retention과 compaction**: `MAXLEN ~100000` 기준. 7일~ 범위에서 `MINID` 기반 trim도 병행. 클라이언트가 trim 범위 이전 `sinceStreamId`로 접속 시 `reload_required` → `GET /blocks`로 full reload.
 
 ### 6.3 DB 쓰기량 비교 (기존 vs 신규)
 
@@ -1531,26 +1734,32 @@ async def migrate_document(doc_id: int):
 
 | 모듈 | 경로 | 활용 방법 |
 |------|------|-----------|
-| DynamicDoc 타입 | `web/shared/dynamic-doc/types.ts` | Block 타입 시스템의 기반으로 확장 |
-| TiptapAdapter | `web/shared/dynamic-doc/adapters/tiptap-adapter.ts` | 데이터 마이그레이션 변환기 (기존 Tiptap JSON → Block[] 변환용) |
-| MarkdownAdapter | `web/shared/dynamic-doc/adapters/markdown-adapter.ts` | 내보내기/붙여넣기 기능 |
-| doc_blocks 테이블 | `api-docs/models/block_model.py` | 스키마 확장하여 사용 (version, depth 등 추가) |
-| Redis Stream 패턴 | `api-docs/snapshot_worker.py` | OperationConsumer에서 같은 패턴 사용 |
-| WebSocket 서버 | `web-socket-for-docs/` | V3 경로 추가하여 Operation + CRDT relay 프로토콜 구현 |
-| yjs (§4.3 Option B 채택 시) | `web/` | 블록 내부 텍스트 CRDT 전용. 프론트엔드만 |
+| DynamicDoc 타입 | `web/shared/dynamic-doc/types.ts` | Block/InlineNode 타입 시스템의 기반. Tiptap 무관이라 그대로 복사 |
+| MarkdownAdapter | `web/shared/dynamic-doc/adapters/markdown-adapter.ts` | 붙여넣기 정규화 + 내보내기. `unified`/`remark` 기반이라 독립적 |
+| constants/utils | `web/shared/dynamic-doc/constants.ts`, `utils.ts` | BlockType/MarkType enum + 타입 가드 |
+| Block 렌더 컴포넌트 (일부) | `web/shared/dynamic-doc/ui/blocks/` | 레이아웃/스타일 참고. 로직은 자체 구현 |
+| doc_blocks 테이블 | `api-docs/models/block_model.py` | 스키마 확장 (yjs_state BYTEA, last_applied_stream_id, version) |
+| Redis Stream 패턴 | `api-docs/snapshot_worker.py` | OperationConsumer에서 유사 패턴 |
+| WebSocket 서버 | `web-socket-for-docs/` | V3 경로 추가, stateless relay + XADD |
+| **pycrdt (워커 전용)** | `api-docs/` | OperationConsumer 내부에서 블록별 일회성 Y.Doc 생성. 인메모리 유지 없음 |
+| yjs (프론트엔드) | `web/` | 블록 내부 텍스트 CRDT 전용 |
 
 ### 10.2 제거/대체하는 것
 
 | 모듈 | 경로 | 대체 |
 |------|------|------|
 | Tiptap / ProseMirror | `web/shared/ui/tiptap/` 전체 | Custom contentEditable |
+| TiptapAdapter | `web/shared/dynamic-doc/adapters/tiptap-adapter.ts` | 불필요 (Tiptap 제거로 의미 없음). 기존 Yjs 문서 마이그레이션 시에만 1회성 사용 |
+| Tiptap mention 자동완성 | `web/shared/dynamic-doc/ui/mention/` | 자체 Popup + Y.Text.insertEmbed |
+| DynamicDocEditor | `web/shared/dynamic-doc/ui/editor/` | BlockEditor (자체) |
 | relay-provider.ts | `web/shared/ui/tiptap/relay-provider.ts` | BlockSyncProvider |
 | use-collaboration-sync-v2 | `web/shared/ui/tiptap/` | useBlockSync |
-| Tiptap 확장들 | `web/shared/ui/tiptap/extensions/` | Custom 인라인 서식 (Selection API) |
-| SnapshotWorker | `api-docs/snapshot_worker.py` | OperationConsumer |
-| doc_snapshots 테이블 | `api-docs/models/snapshot_model.py` | doc_blocks + doc_operations |
-| pycrdt (백엔드) | `api-docs/` | 제거 (CRDT는 프론트엔드만) |
-| V1/V2 WebSocket 핸들러 | `web-socket-for-docs/src/v2/` | V3 Operation + CRDT relay 핸들러 |
+| Tiptap 확장들 | `web/shared/ui/tiptap/extensions/` | Custom 인라인 서식 (Y.Text.format) |
+| SnapshotWorker | `api-docs/snapshot_worker.py` | OperationConsumer (stateless, pycrdt 기반) |
+| doc_snapshots 테이블 | `api-docs/models/snapshot_model.py` | doc_blocks(yjs_state) + doc_operations |
+| V1/V2 WebSocket 핸들러 | `web-socket-for-docs/src/v2/` | V3 핸들러 (blockId 태그 + streamId) |
+
+> **pycrdt 범위 변경**: 이전 설계에선 백엔드에서 pycrdt 제거를 목표로 했으나, "클라이언트 주도 저장"이 위험해 포기. 대신 **pycrdt를 OperationConsumer에만 한정**해 유지한다. WS 서버/API 라우트/프론트엔드는 pycrdt와 무관.
 
 ---
 
@@ -1558,27 +1767,47 @@ async def migrate_document(doc_id: int):
 
 ### 11.1 Custom contentEditable 구현 비용
 
-- **문제**: Tiptap/ProseMirror 없이 직접 구현하므로 인라인 서식, IME, 붙여넣기 등을 모두 자체 처리
+- **문제**: Tiptap/ProseMirror 없이 직접 구현하므로 인라인 서식, IME, 붙여넣기, mention, 멀티 블록 선택 등을 모두 자체 처리 (§5.6).
 - **대응**:
-  - 블록 단위로 독립적이므로 기능을 점진적으로 추가 가능
-  - MVP: paragraph + heading + bold/italic만 → 이후 mention, link, 복잡한 붙여넣기 순차 추가
-  - IME(한국어)는 compositionstart/end로 처리. 초기부터 반드시 고려
+  - 블록 단위로 독립적이므로 기능을 점진적으로 추가 가능.
+  - MVP: paragraph + heading + bold/italic만 → 이후 mention, link, 복잡한 붙여넣기 순차 추가.
+  - IME(한국어/일본어/중국어)는 compositionstart/end 처리 필수. 초기부터 반드시 고려.
+  - 붙여넣기 정규화는 가장 까다로운 영역. Google Docs/Notion/Word 각각의 markup에 대응하는 정규화 룰이 필요.
 
-### 11.2 블록 내부 텍스트 동시 편집 (§4.3 의사결정에 따름)
+### 11.2 블록 내부 텍스트 동시 편집 — 확정 (§4.3 Option B)
 
-- **Option A/D(LWW) 채택 시**: 같은 블록 동시 편집에서 편집 유실 가능. Awareness로 완화
-- **Option B(CRDT) 채택 시**: Y.Text ↔ InlineNode[] 양방향 변환 구현. 브라우저 크래시 시 dirty 블록 유실 (최대 10초분). beforeunload에서 즉시 저장 시도로 완화
-- **Option C(OT) 채택 시**: rich text transform 함수 구현 난이도 및 버그 위험
+Option B(블록별 Y.Text CRDT) 채택. 구현 리스크는 **"Y.Text state bytes의 저장·재생 안정성"** 에 집중되며, state bytes를 블록마다 영구 저장하는 방식이라 Y.Text ↔ JSON 왕복 재생 리스크는 없음.
 
-### 11.3 오프라인 편집
+- 남은 리스크는 **pycrdt 라이브러리의 성숙도 / 엣지 케이스**. Yjs(Rust Y-CRDT)의 Python 바인딩이지만, 드문 edge-case에서 JS Yjs와 수렴 결과가 다를 수 있음 → PoC에서 verify 필요.
+- 플랜 B: pycrdt에 치명적 버그 발견 시 **Node.js로 별도 PersistenceWorker 분리** (Yjs 공식 구현 사용). WS 서버는 그대로, Consumer만 Node로 이전.
+- 자체 CRDT 구현은 **진짜 마지막 수단** (Yjs/Automerge가 수년 쌓은 걸 재현하는 투자).
 
-- **현재 스코프 밖**: 최초 버전에서는 온라인 전용
-- **향후 확장**: OperationQueue를 IndexedDB에 영속화하면 오프라인 → 온라인 동기화 가능
+### 11.3 Redis Stream 운영 리스크
 
-### 11.4 대규모 문서
+- **Stream 크기 증가**: 고빈도 편집 시 하루 수만 entry 가능. `MAXLEN ~100000` + `MINID` (예: 7일 이전) 조합으로 제한.
+- **Trim 범위 초과 접속**: 클라이언트가 오래 오프라인이면 `sinceStreamId`가 이미 trim됨 → `reload_required` 프레임 전송 → 클라이언트는 `GET /blocks` 로 full reload. UI에 "문서가 재로드됩니다" 표시.
+- **Consumer lag**: Stream 적재 속도 > Consumer 처리 속도면 지연 누적. 모니터링 지표: `XLEN stream` vs `last_applied_stream_id`. 임계치 초과 시 Consumer 수평 확장.
+- **Consumer group pending**: XPENDING으로 실패 후 재처리 안 된 메시지 주기 점검. 무한 재시도 방지 위해 dead-letter 로그.
 
-- 블록 1000개 이상: 가상화 + lazy loading (스크롤 시 블록 데이터 추가 로드)
-- 블록 5000개 이상: 페이지 분할 권장 (UX 가이드)
+### 11.4 오프라인 편집
+
+- **현재 스코프 밖**: 최초 버전은 온라인 전용.
+- **향후 확장**: 
+  - 클라이언트가 `y-indexeddb`로 Y.Doc 로컬 persist.
+  - 오프라인 중 생성된 delta는 재접속 시 WS로 일괄 전송.
+  - 단, 오프라인 중 **구조 op**는 서버 권위라 conflict 가능 → 재접속 시 충돌 병합 UX 필요.
+
+### 11.5 대규모 문서
+
+- 블록 1000개 이상: 가상화 + lazy loading (스크롤 시 블록 데이터 추가 로드).
+- 블록 5000개 이상: 페이지 분할 권장 (UX 가이드).
+- 편집 중 블록은 virtualizer의 overscan에 강제 포함 (§5.5 노트 참조).
+
+### 11.6 pycrdt 의존성 리스크
+
+- Python 생태계에서 Y-CRDT 바인딩은 pycrdt (y-py 후속)가 사실상 유일한 선택지.
+- 유지보수 상태·커뮤니티 크기가 Yjs(JS)보다 작음. 주요 릴리즈 lag 존재.
+- **모니터링**: upstream Yjs의 breaking change가 있을 때 pycrdt 동기화 지연이 있으면 플랜 B(Node 워커) 전환을 앞당김.
 
 ---
 
@@ -1586,15 +1815,152 @@ async def migrate_document(doc_id: int):
 
 | 항목 | 기존 | 신규 |
 |------|------|------|
-| 저장 단위 | 문서 전체 (Yjs binary) | 블록 개별 (JSONB row) |
-| 동기화 — 블록 구조 | CRDT state sync | 서버 권위 + Optimistic Lock |
-| 동기화 — 블록 내부 텍스트 | CRDT (문서 전체에 포함) | 블록별 독립 Y.Text (인메모리, DB에 JSON 저장) |
-| DB 부하 | 높음 (주기적 대형 UPSERT) | 낮음 (변경 블록만 소형 UPDATE) |
-| 검색 | 불가 | Full-text search (GIN index) |
-| 기능 확장 | Yjs 스키마 종속 | Block type 추가만으로 확장 |
-| 블록 단위 제어 | 불가 | 권한, 히스토리 가능 |
+| 저장 단위 | 문서 전체 (Yjs binary) | 블록 개별 (`content` JSONB + `yjs_state` BYTEA) |
+| 동기화 — 블록 구조 | CRDT state sync | 서버 권위 + Optimistic Lock (§4.7) |
+| 동기화 — 블록 내부 텍스트 | CRDT (문서 전체) | 블록별 독립 Y.Text. WS는 relay, Consumer가 pycrdt로 state 관리 |
+| 진실의 원천 | DB 스냅샷 | Redis Stream (delta event log). DB는 lag 허용 snapshot |
+| 클라이언트 저장 의존 | 없음 | 없음 (서버 주도 — 이탈/크래시 시 유실 0) |
+| DB 부하 | 높음 (주기적 문서 전체 UPSERT) | 낮음 (변경 블록만 row-level UPDATE) |
+| 검색 | 불가 | Full-text search (GIN index on content JSONB) |
+| 기능 확장 | Yjs 스키마 종속 | Block type 추가만으로 확장 (§13) |
+| 블록 단위 제어 | 불가 | 권한, 히스토리, 댓글, 공유 링크 가능 (§3.5) |
 | 프론트엔드 에디터 | 단일 Tiptap + Yjs | Custom contentEditable (Tiptap 제거) |
-| WebSocket 구조 | 문서당 1개 WS, 전체 delta relay | 문서당 1개 WS, blockId별 delta relay (동일 구조) |
+| WebSocket 구조 | 문서당 1개 WS, 전체 delta relay | 문서당 1개 WS, blockId 태그 + streamId. Stream 적재 추가 |
+| 백엔드 CRDT | pycrdt (SnapshotWorker 전역 Y.Doc) | pycrdt (OperationConsumer 블록별 임시 Y.Doc — stateless) |
+| 서버 stateless | WS만 stateless | WS + API 모두 stateless. Consumer도 인메모리 Y.Doc 유지 없음 |
 | 성능 (초기 로드) | Yjs 바이너리 파싱 | JSON 렌더 + Y.Text 생성 (~5ms/100블록) |
-| 성능 (DB 쓰기) | 30초마다 수십KB~수MB | 10초 debounce, 변경 블록만 ~0.5KB |
-| 예상 전환 기간 | - | ~10주 (5 Phase) |
+| 성능 (DB 쓰기) | 30초마다 수십KB~수MB | 변경 블록당 ~1.5KB (content + state). Stream batch flush |
+| 재접속 lag 보정 | 없음 (스냅샷 의존) | `lastStreamId`로 Stream tail replay → 실시간성 보존 |
+| 예상 전환 기간 | — | ~10주 (5 Phase) |
+
+---
+
+## 13. 커스텀 노드 확장성 & 댓글 시스템
+
+블록이 1급 시민이라는 구조가 실제로 어떤 이점을 주는지. 이 섹션은 "우리가 만든 구조가 해결하려는 제품 요구"를 구체적으로 보여준다.
+
+### 13.1 커스텀 블록 타입 추가
+
+신규 블록 타입 추가는 **DB 마이그레이션 없음**. `type` 컬럼이 VARCHAR이고 `content`가 JSONB이므로 스키마는 그대로.
+
+**절차**:
+1. 타입 상수 추가 (`BlockType` enum에 새 리터럴).
+2. `content` shape 정의 (타입별 `attrs`).
+3. 프론트 렌더러 컴포넌트 추가.
+4. (선택) 슬래시 커맨드 메뉴에 등록.
+
+예시 — "PR mention" 블록:
+```typescript
+// type: 'pr_mention'
+content: {
+  attrs: {
+    repo: 'acme/web',
+    prNumber: 123,
+    title: 'Fix auth race',
+    status: 'merged',  // 주기적 새로고침
+  }
+}
+```
+렌더러는 `attrs.repo/prNumber`로 GitHub API를 호출해 상태 갱신. 다른 사용자들은 DB의 `attrs` 스냅샷을 보되, 각자의 클라이언트가 fresh 값으로 덮어쓸 수 있음 (`update_attrs` op).
+
+### 13.2 커스텀 인라인 노드
+
+`InlineNode` 유니언에 타입을 추가하고 Y.Text에 embed로 박는다:
+
+```typescript
+type InlineNode =
+  | { type: 'text';    text: string; marks?: Mark[] }
+  | { type: 'mention'; attrs: { userId: number; label: string } }
+  | { type: 'equation'; attrs: { latex: string } }    // ← 새 인라인 타입
+  | { type: 'emoji';   attrs: { shortcode: string } }  // ←
+```
+
+```typescript
+// 삽입
+yText.insertEmbed(offset, { type: 'equation', attrs: { latex: 'E=mc^2' } })
+
+// 추출 (Y.Text.toDelta)
+// → [{ retain: 5 }, { insert: { type:'equation', attrs:{latex:'E=mc^2'}} }]
+```
+
+embed는 단일 원자로 취급되어 Backspace가 전체 embed를 삭제. Yjs가 편집 중에도 embed를 보존하므로 별도 로직 불필요.
+
+### 13.3 커스텀 마크
+
+`Mark` 유니언 확장:
+```typescript
+type Mark =
+  | { type: 'bold' }
+  | { type: 'italic' }
+  | { type: 'link'; attrs: { href: string } }
+  | { type: 'highlight'; attrs: { color: string } }   // ← 추가
+  | { type: 'comment'; attrs: { commentId: string } }  // §3.5
+```
+
+`Y.Text.format(index, length, { highlight: { color: 'yellow' }})` 로 부착. 편집 시 mark가 텍스트와 함께 이동.
+
+### 13.4 댓글 — 세 가지 앵커 방식
+
+§3.5에 스키마만 명시했고, 여기서는 **UX 흐름과 결합 방식**:
+
+#### (a) 블록 전체 댓글 (가장 단순)
+- 사이드 패널에 "블록에 대한 스레드" 표시.
+- `block_comments.anchor_type = 'block'`, `block_id`만 기록.
+- 블록 hover 시 말풍선 아이콘 노출, 클릭 → 스레드 오픈.
+
+#### (b) 텍스트 범위 댓글 — `inline_mark` 권장
+- 사용자가 텍스트 선택 후 "댓글" 버튼 클릭.
+- 클라이언트:
+  1. `POST /comments` → `commentId` 받음.
+  2. `Y.Text.format(start, len, { comment: { commentId } })` → `comment` mark 부착.
+  3. 서버 `block_comments`에는 `anchor_type='inline_mark'`, `anchor_mark_id=commentId` 저장.
+- 텍스트 편집 시 mark가 함께 이동 → 앵커 손실 없음.
+- 댓글 해제 시 mark 제거 (`Y.Text.format(start, len, { comment: null })`).
+
+#### (c) Range anchor (offset 기반) — 읽기 전용 상황에서만
+- 외부 도구(예: 승인 워크플로)가 특정 offset에 댓글을 남기고 에디터가 그 이후 수정되지 않는다는 전제.
+- 일반 편집 문서에서는 비추.
+
+### 13.5 댓글과 CRDT의 상호작용
+
+`comment` mark가 붙은 범위가 편집으로 분할되면 Yjs가 자동으로 mark 범위를 확장/분할한다:
+
+```
+"이 부분이 문제입니다"
+           ↑↑↑↑
+      [comment:c-123]
+
+편집: 중간에 "정말 " 삽입
+→ "이 부분이 정말 문제입니다"
+               ↑↑ ↑↑↑↑
+          [comment:c-123]  (둘로 분할, 같은 commentId)
+```
+
+클라이언트가 `comment` mark 범위를 탐색해 "이 댓글이 걸린 텍스트" 를 하이라이트로 그림. 범위가 끊어져도 같은 commentId가 양쪽에 있으므로 단일 앵커로 표시.
+
+**mark 완전 삭제 감지**: 사용자가 mark 범위의 모든 텍스트를 지우면 Y.Text에서 `comment` mark가 사라진다. 주기적으로(또는 `update_content` 수신 시) "orphaned comment" 를 정리:
+```
+UPDATE block_comments SET resolved_at = now()
+WHERE anchor_mark_id NOT IN (
+  SELECT mark_id FROM active_marks WHERE block_id = $1
+);
+```
+
+### 13.6 다른 제품 기능으로 확장
+
+- **블록 링크 공유**: `?block=<blockId>` 쿼리 파라미터. 접속 시 해당 블록으로 스크롤 + 순간 하이라이트. block_id가 안정적 외부 앵커라서 자연스럽게 동작.
+- **알림**: mention mark가 부착되면 서버가 Stream에서 감지 → 사용자에게 알림. `block_id + comment_id` 가 알림의 deep link.
+- **권한**: `block_permissions(block_id, user_id, role)` 테이블 추가 시 블록 단위 ACL 가능 (향후).
+- **번역**: 블록을 단위로 번역 캐시 — `translations(block_id, locale, content JSONB)`. content가 JSON이라 번역기에 바로 투입 가능.
+
+### 13.7 이런 확장성이 기존 구조에서 어려웠던 이유
+
+| 기능 | 기존 (문서 전체 Yjs) | 신규 (블록 기반) |
+|---|---|---|
+| 새 블록 타입 | Yjs 스키마 + Tiptap 노드 + ProseMirror plugin 3곳 수정 | `content.attrs` 정의 + 렌더러만 |
+| 블록 링크 | 블록에 안정적 id가 없음. 파라그래프 offset은 편집에 불안정 | block_id로 고정 |
+| 댓글 앵커 | Yjs position (RelativePosition)이 있으나 외부 시스템 참조 불편 | inline mark + block_id 조합 |
+| 권한 | 문서 단위만 가능 (상태가 하나의 바이너리) | 블록 단위 가능 |
+| 번역/요약 | 문서 전체 파싱 필요 | 블록 JSON 단위로 처리 |
+
+블록을 DB 시민으로 올리는 것의 진짜 가치는 **"외부 시스템이 참조할 안정적 단위"**. 이게 제품 확장성의 근간이 된다.
