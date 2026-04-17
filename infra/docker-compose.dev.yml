@@ -1,0 +1,67 @@
+# Dev overlay — adds hot reload bind mounts and override commands.
+# Usage: docker compose -f infra/docker-compose.yml -f infra/docker-compose.dev.yml up
+
+services:
+  api:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+      target: dev
+    volumes:
+      - ../apps/api/app:/app/app
+      - ../apps/api/tests:/app/tests
+      - api-venv:/app/.venv
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+
+  ws-1:
+    build:
+      context: ../apps/ws
+      dockerfile: Dockerfile
+      target: dev
+    volumes:
+      - ../apps/ws/src:/app/src
+      - ../apps/ws/tsconfig.json:/app/tsconfig.json
+    command: ["npm", "run", "dev"]
+
+  ws-2:
+    build:
+      context: ../apps/ws
+      dockerfile: Dockerfile
+      target: dev
+    volumes:
+      - ../apps/ws/src:/app/src
+      - ../apps/ws/tsconfig.json:/app/tsconfig.json
+    command: ["npm", "run", "dev"]
+
+  web-1:
+    build:
+      context: ../apps/web
+      dockerfile: Dockerfile
+      target: dev
+    volumes:
+      - ../apps/web/src:/app/src
+      - ../apps/web/public:/app/public
+      - ../apps/web/next.config.mjs:/app/next.config.mjs
+      - ../apps/web/tsconfig.json:/app/tsconfig.json
+    command: ["npm", "run", "dev"]
+    environment:
+      WATCHPACK_POLLING: "true"
+
+  web-2:
+    build:
+      context: ../apps/web
+      dockerfile: Dockerfile
+      target: dev
+    volumes:
+      - ../apps/web/src:/app/src
+      - ../apps/web/public:/app/public
+      - ../apps/web/next.config.mjs:/app/next.config.mjs
+      - ../apps/web/tsconfig.json:/app/tsconfig.json
+    command: ["npm", "run", "dev"]
+    environment:
+      WATCHPACK_POLLING: "true"
+
+volumes:
+  api-venv:
