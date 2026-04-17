@@ -9,7 +9,7 @@ const nextConfig = {
                           // twice in dev — harmless but very noisy.
   experimental: {},
   // Next 14 moved serverComponentsExternalPackages under the top-level option.
-  transpilePackages: [],
+  transpilePackages: ["yjs"],
   images: {
     remotePatterns: [{ protocol: "http", hostname: "**" }, { protocol: "https", hostname: "**" }],
   },

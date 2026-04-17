@@ -81,6 +81,7 @@ export const ContentEditableBlock = forwardRef<ContentEditableHandle, Props>(
   ) {
     const domRef = useRef<HTMLDivElement | null>(null);
     const isComposingRef = useRef(false);
+    const handleBeforeInputRef = useRef<(e: FormEvent<HTMLDivElement>) => void>(() => {});
 
     // Ensure the Doc/Text exists and seed with content on first mount.
     const entry = yjs.ensure(block.blockId, block.content.children ?? []);
@@ -94,6 +95,48 @@ export const ContentEditableBlock = forwardRef<ContentEditableHandle, Props>(
       renderInlineNodes(root, nodes);
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    // Cover all input surfaces. Some browsers / Playwright's keyboard.type
+    // skip beforeinput, so we also listen to `input` as a fallback and use
+    // DOM textContent to reconcile the Y.Text.
+    useEffect(() => {
+      const el = domRef.current;
+      if (!el) return;
+      const onBefore = (ev: Event) => {
+        handleBeforeInputRef.current(ev as unknown as FormEvent<HTMLDivElement>);
+      };
+      const onInput = (ev: Event) => {
+        // If the synthetic path already mirrored the change to Y.Text, this
+        // reconciler will be a no-op. If beforeinput didn't fire, we catch up.
+        reconcileFromDom();
+      };
+      el.addEventListener("beforeinput", onBefore);
+      el.addEventListener("input", onInput);
+      return () => {
+        el.removeEventListener("beforeinput", onBefore);
+        el.removeEventListener("input", onInput);
+      };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // Reconcile Y.Text content with DOM textContent when we've lost track of
+    // the exact edit. Preserves caret where possible.
+    const reconcileFromDom = () => {
+      const root = domRef.current;
+      if (!root) return;
+      if (isComposingRef.current) return;
+      const dom = root.textContent ?? "";
+      const yStr = yText.toString();
+      if (dom === yStr) return;
+      // Simplest correct strategy: replace contents. This loses mark info
+      // temporarily, but our renderer will re-apply marks from the Y.Text
+      // state on the next observer run. For plain-text edits (the common
+      // case) this is fine.
+      const caret = getSelectionOffset(root);
+      if (yStr.length > 0) yText.delete(0, yStr.length);
+      if (dom.length > 0) yText.insert(0, dom);
+      if (caret != null) setSelectionOffset(root, Math.min(caret, dom.length));
+    };
 
     // ---- Subscribe to remote updates ----
     useEffect(() => {
@@ -159,6 +202,9 @@ export const ContentEditableBlock = forwardRef<ContentEditableHandle, Props>(
     }));
 
     // ---- Input handler ----
+    // Keep the ref in sync so the native listener (see useEffect above) always
+    // calls the latest closure — props/captured state change each render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     const handleBeforeInput = (e: FormEvent<HTMLDivElement>) => {
       const ev = e.nativeEvent as InputEvent;
       if (isComposingRef.current) return; // let IME composition finish
@@ -264,6 +310,7 @@ export const ContentEditableBlock = forwardRef<ContentEditableHandle, Props>(
         }
       }
     };
+    handleBeforeInputRef.current = handleBeforeInput;
 
     const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
       const root = domRef.current;
